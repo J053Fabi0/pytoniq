@@ -59,6 +59,8 @@ class BaseWallet(Wallet):
     class for user wallets such as v4r2, v3r2, etc.
     """
 
+    VERSION = None
+
     @classmethod
     async def from_private_key(cls, provider: LiteClientLike, private_key: bytes, wc: int = 0,
                                wallet_id: typing.Optional[int] = None, version: str = 'v3r2'):
@@ -78,6 +80,7 @@ class BaseWallet(Wallet):
     @classmethod
     async def from_mnemonic(cls, provider: LiteClientLike, mnemonics: typing.Union[list, str], wc: int = 0,
                             wallet_id: typing.Optional[int] = None, version: str = 'v3r2'):
+        version = cls.VERSION or version
         if isinstance(mnemonics, str):
             mnemonics = mnemonics.split()
         assert mnemonic_is_valid(mnemonics), 'mnemonics are invalid!'
@@ -94,12 +97,14 @@ class BaseWallet(Wallet):
         :param version: wallet version
         :return: mnemonics and Wallet instance of provided version
         """
+        version = cls.VERSION or version
         mnemo = mnemonic_new(24)
         return mnemo, await cls.from_mnemonic(provider, mnemo, wc, wallet_id, version)
 
     @staticmethod
     def raw_create_transfer_msg(private_key: bytes, seqno: int, wallet_id: int, messages: typing.List[WalletMessage],
                                 valid_until: typing.Optional[int] = None) -> Cell:
+        assert len(messages) <= 4, 'for common wallet maximum messages amount is 4'
         signing_message = Builder().store_uint(wallet_id, 32)
         if seqno == 0:
             signing_message.store_bits('1' * 32)  # bin(2**32 - 1)
@@ -123,7 +128,6 @@ class BaseWallet(Wallet):
         :param msgs: list of WalletMessages. to create one call create_wallet_internal_message meth
         :param seqno_from_get_meth: if True LiteClient will request seqno get method and use it, otherwise seqno from contract data will be taken
         """
-        assert len(msgs) <= 4, 'for common wallet maximum messages amount is 4'
         if 'private_key' not in self.__dict__:
             raise WalletError('must specify wallet private key!')
 
@@ -148,6 +152,7 @@ class BaseWallet(Wallet):
         if 'private_key' not in self.__dict__:
             raise WalletError('must specify wallet private key!')
         body = self.raw_create_transfer_msg(private_key=self.private_key, seqno=0, wallet_id=self.wallet_id, messages=[])
+
         return await self.send_external(state_init=self.state_init, body=body)
 
     async def get_seqno(self) -> int:
@@ -282,33 +287,18 @@ class WalletV4(BaseWallet):
 
 class WalletV3R1(WalletV3):
 
+    VERSION = 'v3r1'
+
     @classmethod
     async def from_data(cls, provider: LiteClientLike, public_key: bytes, wc: int = 0,
                         wallet_id: typing.Optional[int] = None, **kwargs):
         return await super().from_code_and_data(provider=provider, code=WALLET_V3_R1_CODE, public_key=public_key, wc=wc,
                                                 wallet_id=wallet_id, **kwargs)
 
-    @classmethod
-    async def from_mnemonic(cls, provider: LiteClientLike, mnemonics: typing.Union[list, str], wc: int = 0,
-                            wallet_id: typing.Optional[int] = None):
-        if isinstance(mnemonics, str):
-            mnemonics = mnemonics.split()
-        assert mnemonic_is_valid(mnemonics), 'mnemonics are invalid!'
-        _, private_key = mnemonic_to_private_key(mnemonics)
-        return await super().from_private_key(provider, private_key, wc, wallet_id, 'v3r1')
-
-    @classmethod
-    async def create(cls, provider: LiteClientLike, wc: int = 0, wallet_id: typing.Optional[int] = None):
-        """
-        :param provider: provider
-        :param wc: wallet workchain
-        :param wallet_id: subwallet_id
-        :return: mnemonics and Wallet instance of provided version
-        """
-        return await super().create(provider=provider, wc=wc, wallet_id=wallet_id, version='v3r1')
-
 
 class WalletV3R2(WalletV3):
+
+    VERSION = 'v3r2'
 
     @classmethod
     async def from_data(cls, provider: LiteClientLike, public_key: bytes, wc: int = 0,
@@ -316,49 +306,13 @@ class WalletV3R2(WalletV3):
         return await super().from_code_and_data(provider=provider, code=WALLET_V3_R2_CODE, public_key=public_key, wc=wc,
                                                 wallet_id=wallet_id, **kwargs)
 
-    @classmethod
-    async def from_mnemonic(cls, provider: LiteClientLike, mnemonics: typing.Union[list, str], wc: int = 0,
-                            wallet_id: typing.Optional[int] = None):
-        if isinstance(mnemonics, str):
-            mnemonics = mnemonics.split()
-        assert mnemonic_is_valid(mnemonics), 'mnemonics are invalid!'
-        _, private_key = mnemonic_to_private_key(mnemonics)
-        return await super().from_private_key(provider, private_key, wc, wallet_id, 'v3r2')
-
-    @classmethod
-    async def create(cls, provider: LiteClientLike, wc: int = 0, wallet_id: typing.Optional[int] = None):
-        """
-        :param provider: provider
-        :param wc: wallet workchain
-        :param wallet_id: subwallet_id
-        :return: mnemonics and Wallet instance of provided version
-        """
-        return await super().create(provider=provider, wc=wc, wallet_id=wallet_id, version='v3r2')
-
 
 class WalletV4R2(WalletV4):
+
+    VERSION = 'v4r2'
 
     @classmethod
     async def from_data(cls, provider: LiteClientLike, public_key: bytes, wc: int = 0,
                         wallet_id: typing.Optional[int] = None, **kwargs):
         return await super().from_code_and_data(provider=provider, code=WALLET_V4_R2_CODE, public_key=public_key, wc=wc,
                                                 wallet_id=wallet_id, **kwargs)
-
-    @classmethod
-    async def from_mnemonic(cls, provider: LiteClientLike, mnemonics: typing.Union[list, str], wc: int = 0,
-                            wallet_id: typing.Optional[int] = None):
-        if isinstance(mnemonics, str):
-            mnemonics = mnemonics.split()
-        assert mnemonic_is_valid(mnemonics), 'mnemonics are invalid!'
-        _, private_key = mnemonic_to_private_key(mnemonics)
-        return await super().from_private_key(provider, private_key, wc, wallet_id, 'v4r2')
-
-    @classmethod
-    async def create(cls, provider: LiteClientLike, wc: int = 0, wallet_id: typing.Optional[int] = None):
-        """
-        :param provider: provider
-        :param wc: wallet workchain
-        :param wallet_id: subwallet_id
-        :return: mnemonics and Wallet instance of provided version
-        """
-        return await super().create(provider=provider, wc=wc, wallet_id=wallet_id, version='v4r2')

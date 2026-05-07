@@ -4,8 +4,8 @@ import logging
 import asyncio
 import socket
 import struct
-import time
 import typing
+from contextlib import suppress
 
 import requests
 from pytoniq_core import HashMap, Builder
@@ -68,6 +68,7 @@ class LiteClient:
         """########### init ###########"""
         self.tasks = {}
         self.inited = False
+        self._closing = False
         self.logger = logging.getLogger(self.__class__.__name__)
         self.timeout = timeout
 
@@ -141,80 +142,130 @@ class LiteClient:
 
     async def receive(self, data_len: int) -> bytes:
         try:
-            data = await self.reader.readexactly(data_len)
-        except ConnectionError:
+            return await self.reader.readexactly(data_len)
+        except (ConnectionError, asyncio.IncompleteReadError):
             await self.close()
             raise
-        return data
 
     async def receive_and_decrypt(self, data_len: int) -> bytes:
         data = self.decrypt(await self.receive(data_len))
         return data
 
     async def listen(self) -> None:
-        while True:
-            while not self.tasks:
-                await asyncio.sleep(self.delta)
+        try:
+            while True:
+                while not self.tasks:
+                    await asyncio.sleep(self.delta)
 
-            data_len_encrypted = await self.receive(4)
-            data_len = int(self.decrypt(data_len_encrypted)[::-1].hex(), 16)
+                data_len_encrypted = await self.receive(4)
+                data_len = int(self.decrypt(data_len_encrypted)[::-1].hex(), 16)
 
-            self.logger.debug(msg=f'received {data_len // 8} bytes of data')
+                self.logger.debug(msg=f'received {data_len // 8} bytes of data')
 
-            data_encrypted = await self.receive(data_len)
-            data_decrypted = self.decrypt(data_encrypted)
-            # check hashsum
-            assert hashlib.sha256(data_decrypted[:-32]).digest() == data_decrypted[-32:], 'incorrect checksum'
-            result = self.deserialize_adnl_query(data_decrypted[:-32])
+                data_encrypted = await self.receive(data_len)
+                data_decrypted = self.decrypt(data_encrypted)
+                # check hashsum
+                assert hashlib.sha256(data_decrypted[:-32]).digest() == data_decrypted[-32:], 'incorrect checksum'
+                result = self.deserialize_adnl_query(data_decrypted[:-32])
 
-            if not result:
-                # for handshake
-                result = {}
+                if not result:
+                    # for handshake
+                    result = {}
 
-            qid = result.get('query_id', result.get('random_id'))  # return query_id for ordinary requests, random_id for ping-pong requests, None for handshake
+                qid = result.get('query_id', result.get('random_id'))  # return query_id for ordinary requests, random_id for ping-pong requests, None for handshake
 
-            request: asyncio.Future = self.tasks.pop(qid)
+                request: asyncio.Future = self.tasks.pop(qid)
 
-            result = result.get('answer', {})
-            if not request.done():
-                request.set_result(result)
+                result = result.get('answer', {})
+                if not request.done():
+                    request.set_result(result)
+        except asyncio.CancelledError:
+            pass
+        except (ConnectionResetError, asyncio.IncompleteReadError, ConnectionAbortedError, TimeoutError):
+            return
+        except Exception as e:
+            self.logger.exception('listener crashed')
+            asyncio.create_task(self.close())
+            return
+        finally:
+            self._cancel_all_tasks()
+
+    def _cancel_all_tasks(self):
+        if self.tasks:
+            for fut in list(self.tasks.values()):
+                if fut and not fut.done():
+                    fut: asyncio.Future
+                    # fut.cancel()
+                    fut.set_exception(LiteClientError('Connection is closed'))
+            self.tasks.clear()
 
     async def connect(self) -> None:
         if self.inited:
             raise LiteClientError('The client is already connected')
         self.loop = asyncio.get_running_loop()
         handshake = self.handshake()
-        self.reader, self.writer = await asyncio.wait_for(asyncio.open_connection(self.server.host, self.server.port), self.timeout)
+        self.reader, self.writer = await asyncio.wait_for(
+            asyncio.open_connection(self.server.host, self.server.port),
+            self.timeout
+        )
         future = await asyncio.wait_for(self.send(handshake, None), self.timeout)
         self.listener = asyncio.create_task(self.listen())
+        await asyncio.wait_for(future, self.timeout)
         await self.update_last_blocks()
         self.pinger = asyncio.create_task(self.ping())
         self.updater = asyncio.create_task(self.block_updater())
-        await future
         self.inited = True
 
-    async def reconnect(self) -> None:
-        await self.close()
-        await self.connect()
+    async def reconnect(self, max_retries: int = 5, retry_delay: int = 2) -> None:
+        """
+        :param max_retries: maximum number of reconnection attempts
+        :param retry_delay: delay between reconnection attempts in seconds
+        :return:
+        """
+        for attempt in range(max_retries):
+            await self.close()
+            try:
+                self.logger.info(f"Reconnection attempt {attempt + 1}/{max_retries}")
+                await self.connect()
+                self.logger.info("Successfully reconnected")
+                return  # exit if connection succeeds
+            except Exception as e:
+                self.logger.error(f"Reconnection attempt {attempt + 1}/{max_retries} failed: {type(e)}: {str(e)}")
+                await asyncio.sleep(retry_delay)
+        raise LiteClientError('Failed to reconnect after several attempts')
 
     async def close(self) -> None:
-        for i in [self.pinger, self.updater, self.listener]:
-            if i.done() and not i.cancelled():
-                i.exception()
-            i.cancel()
-            while not i.done():
-                await asyncio.sleep(0)
-        self.inited = False
-        self.tasks = {}
-        self.reader = None
-        if self.writer:
-            self.writer.close()
+        current = asyncio.current_task()
+        if self._closing:
+            return
+        self._closing = True
+        self._cancel_all_tasks()
         try:
-            await self.writer.wait_closed()
-        except ConnectionError:
-            pass
-        self.writer = None
-        self.logger.info(msg='client has been closed')
+            for task_name in ("pinger", "updater", "listener"):
+                task = getattr(self, task_name, None)
+                if task is None:
+                    continue
+                if task is not current and not task.done():
+                    task.cancel()
+                if task is not current:
+                    try:
+                        await asyncio.wait_for(task, timeout=1.0)
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                setattr(self, task_name, None)
+
+            self.inited = False
+            self.tasks.clear()
+            self.reader = None
+            w = self.writer
+            self.writer = None
+            with suppress(Exception):
+                w.close()
+            with suppress(Exception):
+                await asyncio.wait_for(w.wait_closed(), timeout=1.0)
+        finally:
+            self._closing = False
+        self.logger.info('client has been closed')
 
     def handshake(self) -> bytes:
         rand = get_random(160)
@@ -542,7 +593,7 @@ class LiteClient:
     @staticmethod
     def _find_libs(cell: Cell, libs: list):
         if cell.type_ == 2:
-            libs.append(cell.begin_parse().preload_bytes(32))
+            libs.append(cell.begin_parse().skip_bits(8).preload_bytes(32))
             return True
         res = False
         for ref in cell.refs:  # trick to avoid copying, don't repeat this at home
@@ -600,12 +651,12 @@ class LiteClient:
             self.libs |= await self.get_libraries(libs)
 
         if libs and self.libs:
-            def value_serializer(dest: Builder, src: Cell):
+            def value_serializer(src: Cell, dest: Builder):
                 if src is not None:
                     dest.store_uint(0, 2).store_ref(src).store_maybe_ref(None)
 
             hm = HashMap(256, value_serializer=value_serializer)
-            hm.map = self.libs
+            hm.map = {int(k, 16): v for k, v in self.libs.items() if v is not None}
             emulator.set_libraries(hm.serialize())
 
         # todo set prev blocks info
